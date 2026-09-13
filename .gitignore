@@ -1,0 +1,12 @@
+# Never commit these — MCP_SECRET_PATH is effectively a password and
+# INTERVALS_API_KEY definitely is.
+.env
+.env.*
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Personal deploy notes, not for a public repo.
+HANDOFF.md
