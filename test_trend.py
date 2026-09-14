@@ -9,6 +9,7 @@ The mock is generated relative to today, so a gentler drift can land inside the
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -44,11 +45,17 @@ async def main():
                 print(f"     {res['confound_warning'][:95]}...")
 
             print("\n1b. Partial edge weeks are dropped, not averaged in")
-            check(
-                "clipped week excluded",
-                res["partial_weeks_dropped"] is not None,
-                res["partial_weeks_dropped"],
-            )
+            # The window starts on today's weekday. On a Monday its first week is
+            # whole and the last holds only Monday (a rest day in the mock), so there
+            # is genuinely nothing clipped to drop.
+            if datetime.now(timezone.utc).weekday() == 0:
+                print("     (Monday: no clipped week exists, skipped)")
+            else:
+                check(
+                    "clipped week excluded",
+                    res["partial_weeks_dropped"] is not None,
+                    res["partial_weeks_dropped"],
+                )
             print(f"     dropped: {res['partial_weeks_dropped']}")
             counts = [wk["sessions"] for wk in res["weekly"]]
             check("no unrepresentative 1-2 session weeks left", min(counts) >= 3, f"min {min(counts)}")

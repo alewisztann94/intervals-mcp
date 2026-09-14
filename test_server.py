@@ -54,9 +54,12 @@ async def main() -> None:
             names = sorted(t.name for t in tools.tools)
             print(f"     tools: {names}")
             expected = sorted(
-                ["training_summary", "list_activities", "activity_detail", "wellness", "pace_at_hr_trend"]
+                [
+                    "training_summary", "list_activities", "activity_detail", "wellness",
+                    "pace_at_hr_trend", "power_at_hr_trend",
+                ]
             )
-            check("all five tools exposed", names == expected, str(names))
+            check("all six tools exposed", names == expected, str(names))
             check(
                 "every tool has a description",
                 all((t.description or "").strip() for t in tools.tools),
@@ -69,7 +72,8 @@ async def main() -> None:
             wk = sorted(res["weekly"])[-1]
             sports = res["weekly"][wk]
             print(f"     latest week {wk}: {sports}")
-            check("splits by sport", "Run" in sports)
+            # Any week, not the latest: on a Monday the current week holds no run yet.
+            check("splits by sport", any("Run" in wk for wk in res["weekly"].values()))
             check("current fitness present", res.get("current_fitness") is not None)
             check(
                 "ctl/atl/tsb all present",
@@ -88,7 +92,7 @@ async def main() -> None:
             print("\n5. list_activities — bike only")
             res = payload(await session.call_tool("list_activities", {"days": 30, "activity_type": "Ride"}))
             check("finds rides", res["count"] > 0, str(res["count"]))
-            check("watts surfaced", res["activities"][0]["avg_watts"] is not None)
+            check("watts surfaced", any(a["avg_watts"] is not None for a in res["activities"]))
 
             print("\n6. activity_detail — structured session")
             res = payload(await session.call_tool("list_activities", {"days": 7, "activity_type": "Run"}))

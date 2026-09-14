@@ -1,6 +1,6 @@
 # intervals-icu MCP server
 
-Puts your intervals.icu training data behind five tools that Claude can call
+Puts your intervals.icu training data behind six tools that Claude can call
 directly — no CSV exports, no synced folders, no dependency on your laptop
 being awake.
 
@@ -14,14 +14,32 @@ Claude  ──HTTPS──>  this server (Northflank)  ──HTTPS──>  interv
 | Tool | What it does |
 |---|---|
 | `training_summary(weeks)` | Weekly volume by sport, plus current fitness (CTL), fatigue (ATL) and form. The default overview. |
-| `list_activities(days, activity_type, limit)` | Recent sessions with distance, pace, HR, watts, load. |
+| `list_activities(days, activity_type, limit)` | Recent sessions with distance, pace (runs) or speed (bikes), HR, watts, load. |
 | `activity_detail(activity_id)` | One session in full, including rep-by-rep splits where they exist. |
 | `wellness(days)` | Resting HR, HRV, sleep, weight — plus whether they're trending. |
-| `pace_at_hr_trend(weeks, activity_type, min_hr, max_hr)` | Whether pace at a given HR is improving, flat or declining. |
+| `pace_at_hr_trend(weeks, activity_type, min_hr, max_hr)` | Runs: whether pace at a given HR is improving, flat or declining. Refuses bikes. |
+| `power_at_hr_trend(weeks, activity_type, min_hr, max_hr, environment, include_estimated_power)` | Bikes: whether power at a given HR (efficiency factor) is improving, flat or declining. |
+
+### Sports are normalised
+
+intervals.icu splits one sport across several types. Every tool groups them:
+
+| Sport | intervals.icu types |
+|---|---|
+| `Bike` | Ride, VirtualRide, GravelRide, MountainBikeRide, EBikeRide, EMountainBikeRide, TrackRide, Cyclocross |
+| `Run` | Run, VirtualRun, TrailRun |
+| `Swim` | Swim, OpenWaterSwim |
+
+`training_summary` reports one `Bike` row per week, with `sessions_by_type`
+showing the raw split. Any `activity_type` filter is normalised the same way, so
+`"Bike"`, `"Ride"` and `"VirtualRide"` all match indoor and outdoor rides
+together. Unlisted types (Tennis, WeightTraining...) stay as their own sport.
+
+### The trend tools
 
 `pace_at_hr_trend` is the one worth understanding. Speed per heartbeat is the
-honest read on aerobic fitness, but it moves with session *mix* as well as
-fitness, so:
+honest read on aerobic fitness for running, but it moves with session *mix* as
+well as fitness, so:
 
 - Pass `min_hr` / `max_hr` to compare like with like (`min_hr=140` for
   sub-threshold work, `max_hr=130` for easy running).
@@ -30,6 +48,61 @@ fitness, so:
 - Weeks clipped by the window edge are dropped rather than averaged in.
 - The flat band is ±2%, deliberately wide. Efficiency swings on heat, hills and
   terrain; anything smaller is noise.
+- Weekly means are weighted by session duration, so a long run counts for more
+  than a short jog. Weekly pace is total time over total distance.
+- It refuses bike types. Bike speed is dominated by gradient, wind, drafting and
+  position, so speed per heartbeat is not a fitness signal on a bike, and a
+  plausible-looking number would be worse than an error.
+
+`power_at_hr_trend` is the bike equivalent. Per week it reports
+`efficiency_factor` = duration-weighted normalised power ÷ duration-weighted
+average HR — the same EF intervals.icu shows per activity — with the same
+verdict block, ±2% band, partial-week dropping and HR confound warning.
+
+- **Power source.** Only *measured* power (`device_watts` true: a smart trainer
+  or power meter) is used by default. Rides with estimated power, or none, are
+  excluded and counted. `include_estimated_power=True` lets estimates in, with a
+  warning — an estimate models speed and gradient, so an EF trend built from it
+  is circular.
+- **Indoor vs outdoor.** Rides are flagged indoor when `trainer` is set *or* the
+  type is `Virtual*` (Garmin-synced Zwift rides arrive with `trainer` null). Each
+  week reports indoor and outdoor session counts, and an `environment_warning`
+  appears when both are present, because trainer and outdoor power meter
+  readings differ by a few percent. `environment="indoor"`/`"outdoor"` filters.
+  This is a flag rather than a hard split so measured outdoor rides join
+  automatically once a power meter is fitted.
+- Sessions under 10 minutes are ignored.
+
+### Watts and timing in activity data
+
+- `avg_watts` is true average power (`icu_average_watts`); `np_watts` is
+  normalised power (`icu_weighted_avg_watts`). `power_source` is `measured`,
+  `estimated` or null.
+- An activity's `minutes` is **moving** time. `activity_detail` also returns
+  `moving_seconds` and `elapsed_seconds`.
+- Interval `seconds` come from intervals.icu's analysis of the recording, which
+  runs on the **elapsed** timeline. On a ride with stops the intervals therefore
+  sum to more than the activity's minutes, and interval average watts include the
+  stopped, zero-watt time.
+- When intervals.icu finds no distinct efforts it returns the whole activity as a
+  single interval typed by intensity — often `RECOVERY` on an easy ride. That is
+  not a failed request; `activity_detail` reports it as "no distinct efforts"
+  instead of presenting it as an interval.
+- Interval types and zones are computed against the FTP and HR zones in your
+  intervals.icu sport settings (`ftp_setting_watts` shows the FTP used), so they
+  are only as accurate as those settings.
+
+## Future work
+
+- **eFTP and the power-duration curve.** Expose intervals.icu's eFTP and power
+  curve. Becomes the primary bike progression metric once a real FTP test
+  anchors it.
+- **Decoupling / Pw:HR drift on long rides.** The standard aerobic-durability
+  measure. intervals.icu already computes `decoupling` per activity; it needs a
+  trend tool restricted to long steady rides. Needed once 4–6 hour rides are
+  routine.
+- **Swim units.** Swims still report `pace_min_km`; pace per 100m would suit them
+  better.
 
 ## Caching
 
@@ -137,6 +210,7 @@ python server.py
 
 # terminal 3
 python test_server.py
+python test_bike.py
 python test_cache.py     # needs the server started with CACHE_TTL_SECONDS=3 and MOCK_DRIFT unset
 
 # then restart the mock with MOCK_DRIFT=0.006 (a declining block) and run:
@@ -144,6 +218,10 @@ python test_trend.py
 ```
 
 - `test_server.py` — secret path, tool discovery, every tool's shape, bad input.
+- `test_bike.py` — sport normalisation in summaries and filters, speed vs pace
+  units, the pace-trend bike guard, `power_at_hr_trend` (measured-only default,
+  exclusion counts, EF definition, duration weighting, environment and
+  estimated-power flags), and steady rides reported as "no distinct efforts".
 - `test_trend.py` — that a declining block reads as declining, partial weeks are
   dropped, a shifting session mix raises the confound warning, and thin data
   produces no verdict rather than a confident wrong one.
