@@ -713,35 +713,41 @@ async def compare_sessions(
 ) -> dict:
     """Compare the same workout across dates, rep by rep (pace and heart rate of every rep).
 
-    Finds runs whose name contains name_contains (e.g. "Perth - 3k"), then pulls
+    Finds runs whose name contains name_contains (e.g. "Perth - 2k"), then pulls
     out the work reps only. Recoveries, warm-up and cool-down are left out, because
     an average that includes them measures how long you rested, not how fit you are.
 
     How reps are picked out of the recording:
-      - Recovery blocks are dropped.
-      - Anything shorter than min_rep_seconds (default 90s) is dropped: lap-button
-        taps, strides and short jogs aren't reps.
-      - Warm-up and cool-down kilometres are dropped by heart rate: a group of
-        similar laps only counts as reps if its average HR is above min_rep_hr.
-        By default that is the top of your easy zone (zone 1) from intervals.icu,
-        so easy running never counts as a rep. A rep recorded with a heart-rate
-        dropout can be left out this way; left_out counts everything dropped.
+      - A rep can span several laps. A watch that auto-laps every kilometre records
+        a 2km rep as two work laps back to back, so adjacent work laps at about the
+        same pace are joined into one rep (laps says how many). A recovery jog, a
+        slow lap or a stop ends the rep; a 1-second lap-button press does not.
+      - Recovery blocks are dropped, and so is anything shorter than
+        min_rep_seconds (default 90s): strides and short jogs aren't reps.
+      - Warm-up and cool-down are dropped by heart rate: a group of similar laps
+        only counts as reps if its average HR is above min_rep_hr. By default that
+        is the top of your easy zone (zone 1) from intervals.icu, so easy running
+        never counts as a rep. Pass min_rep_hr=0 to skip the heart-rate test.
+      - A lap whose HR is low but whose pace is within 10% of the session's other
+        reps is still a rep: the strap dropped out, or HR was still climbing. It is
+        kept and marked low_hr, and its HR is left out of mean_hr. left_out counts
+        everything dropped and why.
 
     Reps of different lengths are never averaged together, because a 1km rep
-    and a 6-minute rep are run at different paces at the same fitness. Pass
+    and an 8-minute rep are run at different paces at the same fitness. Pass
     rep_seconds to keep only reps of about that length (e.g. rep_seconds=270 for
-    1km reps at about 4:30, or 360 for 6-minute reps). Without it, each session's
+    1km reps at about 4:30, or 480 for 8-minute reps). Without it, each session's
     reps are split into sets of similar length and reported separately.
 
     Each rep has pace, gap_min_km (grade-adjusted pace — compare this one across
     days on different routes) and HR. Set averages are weighted by rep duration.
 
     Args:
-        name_contains: Text the run's name must contain, case-insensitive, e.g. "Perth - 3k".
+        name_contains: Text the run's name must contain, case-insensitive, e.g. "Perth - 2k".
         rep_seconds: Only keep reps lasting about this many seconds.
         tolerance_pct: How far a rep may be from rep_seconds and still count, in percent (default 15).
         min_rep_hr: Heart rate a group of laps must average above to count as reps.
-            Defaults to the top of zone 1 in your intervals.icu run settings.
+            Defaults to the top of zone 1 in your intervals.icu run settings. 0 disables the test.
         min_rep_seconds: Ignore anything shorter than this (default 90).
         days: How far back to search (default 365).
         limit: Compare at most this many sessions, the most recent (default 10).
@@ -766,11 +772,16 @@ async def compare_sessions(
     matches.sort(key=lambda a: str(a.get("start_date_local") or ""))
     matches = matches[-limit:]
 
+    # One intervals call per session; a few at a time is plenty and stays well
+    # clear of intervals.icu's rate limit.
+    gate = asyncio.Semaphore(4)
+
     async def intervals_for(act: dict) -> list[dict]:
-        try:
-            payload = await fetch(f"/activity/{act['id']}/intervals")
-        except RuntimeError:
-            return []
+        async with gate:
+            try:
+                payload = await fetch(f"/activity/{act['id']}/intervals")
+            except RuntimeError:
+                return []
         return [it for it in (payload or {}).get("icu_intervals") or [] if isinstance(it, dict)]
 
     all_intervals = await asyncio.gather(*(intervals_for(a) for a in matches))
@@ -778,7 +789,7 @@ async def compare_sessions(
     sessions = []
     comparison = []
     for act, items in zip(matches, all_intervals):
-        reps, excluded = _pick_reps(items, min_rep_seconds, min_rep_hr)
+        reps, excluded, session_note = _pick_reps(items, min_rep_seconds, min_rep_hr)
         if rep_seconds:
             keep = [r for r in reps if abs(r["seconds"] - rep_seconds) <= rep_seconds * tolerance]
             excluded["other_length"] = len(reps) - len(keep)
@@ -802,6 +813,7 @@ async def compare_sessions(
                 "elevation_m_per_km": _elev_per_km(act.get("total_elevation_gain"), act.get("distance")),
                 "rep_sets": session_sets,
                 "left_out": excluded,
+                "note": session_note,
             }
         )
 
@@ -821,18 +833,78 @@ async def compare_sessions(
     }
 
 
-def _pick_reps(items: list[dict], min_seconds: int, min_hr: int | None) -> tuple[list[dict], dict]:
-    """Work reps from intervals.icu's intervals, plus a count of what was left out and why."""
+# Laps shorter than this are lap-button presses: they neither count nor end a rep.
+TAP_SECONDS = 15
+# Adjacent work laps whose pace is within this of the rep so far are the same rep
+# (a 2km rep auto-lapped every km). Warm-up to rep is a 25%+ jump, so this is safe.
+MERGE_TOLERANCE = 0.15
+# A low-HR lap at most this much slower than the session's other reps is a rep
+# with an HR dropout, not easy running.
+RESCUE_TOLERANCE = 0.10
+
+
+def _lap_speed(lap: dict) -> float:
+    return (_num(lap.get("distance")) or 0) / lap["seconds"]
+
+
+def _join_laps(laps: list[dict]) -> dict:
+    """One rep from the laps that make it up, totals summed and means duration-weighted."""
+    secs = sum(lap["seconds"] for lap in laps)
+    hrs = [(_num(lap.get("average_heartrate")), lap["seconds"]) for lap in laps]
+    hrs = [(h, s) for h, s in hrs if h]
+    gaps = [(_num(lap.get("gap")), lap["seconds"]) for lap in laps]
+    gains = [_num(lap.get("total_elevation_gain")) for lap in laps]
+    groups = {lap.get("group_id") for lap in laps}
+    return {
+        "seconds": secs,
+        "distance": sum(_num(lap.get("distance")) or 0 for lap in laps),
+        "average_heartrate": _wmean(hrs) if hrs else None,
+        # GAP is a speed, so weighting by time gives the true mean over the rep.
+        # Any lap without it (treadmill) leaves the rep without it.
+        "gap": _wmean(gaps) if all(g for g, _ in gaps) else None,
+        "total_elevation_gain": sum(g for g in gains if g is not None) if any(g is not None for g in gains) else None,
+        # intervals.icu's lap grouping only carries over when every lap agrees.
+        "group_id": groups.pop() if len(groups) == 1 else None,
+        "position": laps[0]["position"],
+        "laps": len(laps),
+    }
+
+
+def _pick_reps(items: list[dict], min_seconds: int, min_hr: int | None) -> tuple[list[dict], dict, str | None]:
+    """Work reps from intervals.icu's laps, a count of what was left out and why, and a note.
+
+    A rep can span several laps: a watch that auto-laps every kilometre records a
+    2km rep as two WORK laps back to back, sometimes with a 1-second lap-button
+    press between them. Adjacent work laps at about the same pace are joined into
+    one rep; anything else lasting TAP_SECONDS or more ends it.
+    """
     excluded = {"recovery": 0, "too_short": 0, "easy_running": 0}
-    work = []
+    blocks: list[list[dict]] = []
+    current: list[dict] | None = None
     for n, it in enumerate(items, start=1):
-        secs = _num(it.get("elapsed_time")) or _num(it.get("moving_time"))
-        if str(it.get("type") or "").upper() != "WORK":
+        secs = _num(it.get("elapsed_time")) or _num(it.get("moving_time")) or 0
+        dist = _num(it.get("distance")) or 0
+        is_work = str(it.get("type") or "").upper() == "WORK"
+        if secs < TAP_SECONDS:
+            excluded["too_short" if is_work else "recovery"] += 1
+            continue  # a lap-button press: doesn't split the rep it landed in
+        if not is_work:
             excluded["recovery"] += 1
-        elif not secs or secs < min_seconds or not _num(it.get("distance")):
+            current = None
+            continue
+        if secs < min_seconds or dist < 100:
             excluded["too_short"] += 1
-        else:
-            work.append({**it, "seconds": secs, "position": n})
+            current = None
+            continue
+        lap = {**it, "seconds": secs, "position": n}
+        if current is not None:
+            so_far = sum(_num(m.get("distance")) or 0 for m in current) / sum(m["seconds"] for m in current)
+            if abs(_lap_speed(lap) - so_far) <= so_far * MERGE_TOLERANCE:
+                current.append(lap)
+                continue
+        current = [lap]
+        blocks.append(current)
+    work = [_join_laps(b) for b in blocks]
 
     # intervals.icu groups laps that look alike (similar length and effort). Judge
     # easy vs rep by the group's average HR, so a first rep whose HR is still
@@ -840,27 +912,51 @@ def _pick_reps(items: list[dict], min_seconds: int, min_hr: int | None) -> tuple
     by_group: dict[Any, list[dict]] = defaultdict(list)
     for w in work:
         by_group[w.get("group_id") or f"solo-{w['position']}"].append(w)
-    reps = []
+    reps: list[dict] = []
+    low_hr: list[dict] = []
     for members in by_group.values():
-        hrs = [(_num(m.get("average_heartrate")), m["seconds"]) for m in members]
-        hrs = [(h, s) for h, s in hrs if h]
+        hrs = [(m["average_heartrate"], m["seconds"]) for m in members if m["average_heartrate"]]
         group_hr = _wmean(hrs) if hrs else None
-        if min_hr is not None and (group_hr is None or group_hr <= min_hr):
-            excluded["easy_running"] += len(members)
+        if min_hr and (group_hr is None or group_hr <= min_hr):
+            low_hr.extend(members)
         else:
             reps.extend(members)
+
+    # Second opinion by pace: a lap run at rep pace with a low HR is a rep whose
+    # strap dropped out (or whose HR was still climbing), not easy running.
+    if reps and low_hr:
+        ref = statistics.median(_lap_speed(r) for r in reps)
+        for r in low_hr:
+            if _lap_speed(r) >= ref * (1 - RESCUE_TOLERANCE):
+                reps.append({**r, "low_hr": True})
+            else:
+                excluded["easy_running"] += r["laps"]
+    else:
+        excluded["easy_running"] += sum(r["laps"] for r in low_hr)
+
+    note = None
+    if work and not reps:
+        hardest = max((r["average_heartrate"] for r in work if r["average_heartrate"]), default=None)
+        note = (
+            f"No laps cleared min_rep_hr={min_hr}"
+            + (f": the hardest block averaged {hardest:.0f} bpm" if hardest else "")
+            + ". Re-run with a lower min_rep_hr (reps run at the very top of the easy zone, or "
+            "a heart-rate strap that failed), or min_rep_hr=0 to keep every work lap, warm-up included."
+        )
     reps.sort(key=lambda r: r["position"])
-    return reps, excluded
+    return reps, excluded, note
 
 
 def _split_by_length(reps: list[dict], tolerance: float) -> list[list[dict]]:
-    """Split reps into sets of similar duration (within tolerance of the set's first rep)."""
+    """Split reps into sets of similar duration (within tolerance of the set's median)."""
     sets: list[list[dict]] = []
     for rep in sorted(reps, key=lambda r: r["seconds"]):
-        if sets and rep["seconds"] <= sets[-1][0]["seconds"] * (1 + tolerance):
-            sets[-1].append(rep)
-        else:
-            sets.append([rep])
+        if sets:
+            typical = statistics.median(r["seconds"] for r in sets[-1])
+            if rep["seconds"] <= typical * (1 + tolerance):
+                sets[-1].append(rep)
+                continue
+        sets.append([rep])
     for s in sets:
         s.sort(key=lambda r: r["position"])
     return sorted(sets, key=lambda s: -len(s))
@@ -868,28 +964,36 @@ def _split_by_length(reps: list[dict], tolerance: float) -> list[list[dict]]:
 
 def _set_summary(rep_set: list[dict]) -> dict:
     secs = sum(r["seconds"] for r in rep_set)
-    dist = sum(_num(r.get("distance")) or 0 for r in rep_set)
-    gaps = [(_num(r.get("gap")), r["seconds"]) for r in rep_set if _num(r.get("gap"))]
-    hrs = [(_num(r.get("average_heartrate")), r["seconds"]) for r in rep_set if _num(r.get("average_heartrate"))]
+    dist = sum(r["distance"] for r in rep_set)
+    gaps = [(r["gap"], r["seconds"]) for r in rep_set if r["gap"]]
+    # A rep kept for its pace despite a low HR has an HR reading that's wrong or
+    # lagging, so it doesn't go into the set's mean.
+    hrs = [(r["average_heartrate"], r["seconds"]) for r in rep_set
+           if r["average_heartrate"] and not r.get("low_hr")]
     return {
         "rep_count": len(rep_set),
         "typical_rep_seconds": round(statistics.median(r["seconds"] for r in rep_set)),
-        "typical_rep_km": round(statistics.median(_num(r.get("distance")) or 0 for r in rep_set) / 1000, 2),
+        "typical_rep_km": round(statistics.median(r["distance"] for r in rep_set) / 1000, 2),
         "mean_pace_min_km": _pace(dist, secs),
         "mean_gap_min_km": _pace_from_speed(_wmean(gaps)) if gaps else None,
         "mean_hr": round(_wmean(hrs), 1) if hrs else None,
+        "low_hr_reps": sum(1 for r in rep_set if r.get("low_hr")),
     }
 
 
 def _rep_row(rep: dict) -> dict:
-    return {
+    row = {
         "seconds": round(rep["seconds"]),
-        "km": round((_num(rep.get("distance")) or 0) / 1000, 2),
-        "pace_min_km": _pace(rep.get("distance"), rep["seconds"]),
-        "gap_min_km": _pace_from_speed(rep.get("gap")),
-        "avg_hr": _num(rep.get("average_heartrate")),
-        "elevation_m_per_km": _elev_per_km(rep.get("total_elevation_gain"), rep.get("distance")),
+        "km": round(rep["distance"] / 1000, 2),
+        "laps": rep["laps"],
+        "pace_min_km": _pace(rep["distance"], rep["seconds"]),
+        "gap_min_km": _pace_from_speed(rep["gap"]),
+        "avg_hr": round(rep["average_heartrate"]) if rep["average_heartrate"] else None,
+        "elevation_m_per_km": _elev_per_km(rep["total_elevation_gain"], rep["distance"]),
     }
+    if rep.get("low_hr"):
+        row["low_hr"] = True
+    return row
 
 
 @mcp.tool()
@@ -977,6 +1081,7 @@ async def easy_pace_trend(
         )
 
     dropped_partial = _drop_partial_weeks(per_week)
+    light = _light_weeks(per_week)
 
     series = []
     for wk in sorted(per_week):
@@ -1006,30 +1111,49 @@ async def easy_pace_trend(
         },
         "runs_left_out": left_out,
         "partial_weeks_dropped": dropped_partial or None,
+        # Weeks with well under the usual number of easy runs (illness, a race
+        # week, a holiday). They stay in the table, because they happened, but
+        # their single figures are one or two runs and read as outliers.
+        "light_weeks": light or None,
         "weekly": series,
-        "earlier_vs_recent": _halves(series),
+        "earlier_vs_recent": _halves(per_week),
     }
 
 
-def _halves(series: list[dict]) -> dict | None:
-    """First half of the weeks against the second half, pace and HR side by side."""
-    if len(series) < 4:
+def _light_weeks(per_week: dict[date, list]) -> list[str]:
+    """Weeks with fewer than half the typical number of runs, oldest first."""
+    if len(per_week) < 4:
+        return []
+    counts = sorted(len(v) for v in per_week.values())
+    typical = counts[len(counts) // 2]
+    return [wk.isoformat() for wk in sorted(per_week) if len(per_week[wk]) * 2 < typical]
+
+
+def _halves(per_week: dict[date, list[dict]]) -> dict | None:
+    """First half of the weeks against the second half, pace and HR side by side.
+
+    Each half pools its runs and weights by duration, like the weekly figures,
+    so a week holding one short run barely moves it.
+    """
+    weeks = sorted(per_week)
+    if len(weeks) < 4:
         return None
-    half = len(series) // 2
+    half = len(weeks) // 2
 
-    def summarise(weeks: list[dict]) -> dict:
-        def to_secs(p: str) -> int:
-            m, s = p.split(":")
-            return int(m) * 60 + int(s)
-
-        gap_secs = statistics.mean(to_secs(w["mean_gap_min_km"]) for w in weeks)
+    def summarise(wks: list[date]) -> dict:
+        rows = [r for wk in wks for r in per_week[wk]]
+        dist = sum(r["dist"] for r in rows)
+        secs = sum(r["secs"] for r in rows)
         return {
-            "weeks": f"{weeks[0]['week_start']} to {weeks[-1]['week_start']}",
-            "mean_gap_min_km": f"{int(gap_secs // 60)}:{int(gap_secs % 60):02d}",
-            "mean_hr": round(statistics.mean(w["mean_hr"] for w in weeks), 1),
+            "weeks": f"{wks[0].isoformat()} to {wks[-1].isoformat()}",
+            "runs": len(rows),
+            "km": round(dist / 1000, 1),
+            "mean_gap_min_km": _pace_from_speed(_wmean([(r["gap"], r["secs"]) for r in rows])),
+            "mean_pace_min_km": _pace(dist, secs),
+            "mean_hr": round(_wmean([(r["hr"], r["secs"]) for r in rows]), 1),
         }
 
-    return {"earlier": summarise(series[:half]), "recent": summarise(series[half:])}
+    return {"earlier": summarise(weeks[:half]), "recent": summarise(weeks[half:])}
 
 
 @mcp.tool()

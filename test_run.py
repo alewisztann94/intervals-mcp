@@ -78,44 +78,95 @@ async def main():
                   any(x["name"] == "Perth - club champs" and x["found_by"] == "name_contains" for x in rh2["races"]))
 
             print("\n4. compare_sessions: work reps only")
-            cs = payload(await s.call_tool("compare_sessions", {"name_contains": "perth - 3k", "limit": 4}))
+            cs = payload(await s.call_tool("compare_sessions", {"name_contains": "perth - 1k", "limit": 4}))
             print(f"     filter: {cs['rep_filter']}")
             for row in cs["comparison"]:
                 print(f"     {row}")
             check("found sessions", cs["sessions_found"] == 4, cs["sessions_found"])
             check("min_rep_hr defaults to top of zone 1", cs["rep_filter"]["min_rep_hr"] == 140)
+            check("one set of reps per session", all(len(x["rep_sets"]) == 1 for x in cs["sessions"]))
+            first_sets = [x["rep_sets"][0] for x in cs["sessions"]]
+            check("exactly the 10 reps in every session",
+                  all(x["rep_count"] == 10 and len(x["reps"]) == 10 for x in first_sets),
+                  [x["rep_count"] for x in first_sets])
+            check("each 1km rep is a single lap", all(r["laps"] == 1 for x in first_sets for r in x["reps"]))
             last = cs["sessions"][-1]
             print(f"     left out of last session: {last['left_out']}")
-            check("one set of reps per session", all(len(x["rep_sets"]) == 1 for x in cs["sessions"]))
-            rep_set = last["rep_sets"][0]
-            check("exactly the 10 reps", rep_set["rep_count"] == 10 and len(rep_set["reps"]) == 10, rep_set["rep_count"])
-            check("recoveries left out and counted", last["left_out"]["recovery"] == 18, last["left_out"])
-            check("stride left out as too short", last["left_out"]["too_short"] == 1, last["left_out"])
-            check("warm-up and cool-down km left out as easy running", last["left_out"]["easy_running"] == 5,
-                  last["left_out"])
-            check("first rep kept despite lagging HR", rep_set["reps"][0]["avg_hr"] == 139)
+            check("recoveries left out and counted", all(x["left_out"]["recovery"] == 18 for x in cs["sessions"]),
+                  [x["left_out"] for x in cs["sessions"]])
+            check("stride left out as too short", all(x["left_out"]["too_short"] == 1 for x in cs["sessions"]))
+            check("warm-up and cool-down km left out as easy running",
+                  all(x["left_out"]["easy_running"] == 5 for x in cs["sessions"]), [x["left_out"] for x in cs["sessions"]])
+            # Some recordings carry intervals.icu's lap groups, some (manual laps) have none.
+            # Either way the lagging first rep must survive, by its group's HR or by its pace.
+            grouped = [x for x in first_sets if x["low_hr_reps"] == 0]
+            manual = [x for x in first_sets if x["low_hr_reps"] == 1]
+            check("both grouped and ungrouped recordings present", bool(grouped and manual),
+                  [x["low_hr_reps"] for x in first_sets])
+            check("grouped: lagging first rep kept by its group's HR, not flagged",
+                  all(x["reps"][0]["avg_hr"] == 139 and not x["reps"][0].get("low_hr") for x in grouped))
+            check("ungrouped: lagging first rep kept by pace and marked low_hr",
+                  all(x["reps"][0]["avg_hr"] == 139 and x["reps"][0].get("low_hr") is True for x in manual))
+            check("mean_hr not dragged down by the lagging rep", all(x["mean_hr"] > 147 for x in first_sets),
+                  [x["mean_hr"] for x in first_sets])
             check("every rep has pace, GAP and HR",
-                  all(x["pace_min_km"] and x["gap_min_km"] and x["avg_hr"] for x in rep_set["reps"]))
+                  all(r["pace_min_km"] and r["gap_min_km"] and r["avg_hr"] for x in first_sets for r in x["reps"]))
             check("no rep slower than 5:30/km (no warm-up or recovery leaked in)",
-                  all(secs(x["pace_min_km"]) < 330 for x in rep_set["reps"]))
+                  all(secs(r["pace_min_km"]) < 330 for x in first_sets for r in x["reps"]))
             check("comparison is oldest first",
                   [x["date"] for x in cs["comparison"]] == sorted(x["date"] for x in cs["comparison"]))
 
-            print("\n5. compare_sessions: rep lengths never mixed")
-            mixed = payload(await s.call_tool("compare_sessions", {"name_contains": "Timed medium", "limit": 2}))
-            sets = mixed["sessions"][-1]["rep_sets"]
-            print(f"     sets: {[(x['rep_count'], x['typical_rep_seconds']) for x in sets]}")
-            check("1km and ~3min reps reported as separate sets", len(sets) == 2 and all(x["rep_count"] == 4 for x in sets))
-            only_1k = payload(await s.call_tool("compare_sessions",
-                                                {"name_contains": "Timed medium", "rep_seconds": 280, "limit": 2}))
-            kept = only_1k["sessions"][-1]
-            print(f"     rep_seconds=280: {[(x['rep_count'], x['typical_rep_seconds']) for x in kept['rep_sets']]}, "
-                  f"left out {kept['left_out']}")
-            check("rep_seconds keeps only reps of that length",
-                  len(kept["rep_sets"]) == 1 and kept["rep_sets"][0]["rep_count"] == 4)
-            check("other-length reps counted as left out", kept["left_out"].get("other_length") == 4)
+            print("\n5. compare_sessions: reps that span several laps")
+            two_k = payload(await s.call_tool("compare_sessions", {"name_contains": "Perth - 2k", "limit": 2}))
+            sess = two_k["sessions"][-1]
+            sets = sess["rep_sets"]
+            print(f"     2k sets: {[(x['rep_count'], x['typical_rep_seconds'], x['typical_rep_km']) for x in sets]}, "
+                  f"left out {sess['left_out']}")
+            check("auto-lapped 2km reps come back as 4 reps of 2 laps",
+                  len(sets) == 1 and sets[0]["rep_count"] == 4
+                  and all(r["laps"] == 2 and 1.9 <= r["km"] <= 2.1 for r in sets[0]["reps"]),
+                  sets and sets[0]["reps"])
+            check("typical rep is the whole 2km", 470 <= sets[0]["typical_rep_seconds"] <= 580,
+                  sets[0]["typical_rep_seconds"])
+            check("warm-up running straight into rep 1 is not joined to it", sess["left_out"]["easy_running"] == 5,
+                  sess["left_out"])
+            check("lap-button tap inside a rep does not split it", sess["left_out"]["recovery"] == 7, sess["left_out"])
+            dropout = sets[0]["reps"][-1]
+            print(f"     dropout rep: {dropout}")
+            check("rep with an HR dropout kept and marked low_hr",
+                  dropout.get("low_hr") is True and dropout["avg_hr"] < 140, dropout)
+            check("counted in low_hr_reps", sets[0]["low_hr_reps"] == 1)
+            check("its HR left out of mean_hr", sets[0]["mean_hr"] > 147, sets[0]["mean_hr"])
+
+            timed = payload(await s.call_tool("compare_sessions", {"name_contains": "Timed medium", "limit": 2}))
+            tsets = timed["sessions"][-1]["rep_sets"]
+            print(f"     timed sets: {[(x['rep_count'], x['typical_rep_seconds'], x['typical_rep_km']) for x in tsets]}")
+            check("8-minute reps auto-lapped into 1km + remainder come back whole",
+                  len(tsets) == 1 and tsets[0]["rep_count"] == 4 and 420 <= tsets[0]["typical_rep_seconds"] <= 495
+                  and all(r["laps"] == 2 for r in tsets[0]["reps"]), tsets)
+            only_8 = payload(await s.call_tool("compare_sessions",
+                                               {"name_contains": "Timed medium", "rep_seconds": 480, "limit": 2}))
+            check("rep_seconds keeps reps of that length",
+                  len(only_8["sessions"][-1]["rep_sets"]) == 1 and only_8["sessions"][-1]["rep_sets"][0]["rep_count"] == 4)
+            not_1k = payload(await s.call_tool("compare_sessions",
+                                               {"name_contains": "Timed medium", "rep_seconds": 270, "limit": 2}))
+            kept = not_1k["sessions"][-1]
+            print(f"     rep_seconds=270 on 8-minute reps: {kept['rep_sets']}, left out {kept['left_out']}")
+            check("the km pieces of a longer rep never pass as 1km reps",
+                  kept["rep_sets"] == [] and kept["left_out"].get("other_length") == 4, kept["left_out"])
+
+            ladder = payload(await s.call_tool("compare_sessions", {"name_contains": "Perth - ladder", "limit": 1}))
+            lsets = ladder["sessions"][-1]["rep_sets"]
+            print(f"     ladder sets: {[(x['rep_count'], x['typical_rep_seconds'], x['typical_rep_km']) for x in lsets]}")
+            check("two rep lengths reported as separate sets",
+                  {(x["rep_count"], round(x["typical_rep_km"])) for x in lsets} == {(4, 1), (3, 2)}, lsets)
             none = payload(await s.call_tool("compare_sessions", {"name_contains": "no such run"}))
             check("no match explains itself", none["sessions_found"] == 0 and none["note"])
+            no_hr = payload(await s.call_tool("compare_sessions",
+                                              {"name_contains": "Perth - 2k", "min_rep_hr": 0, "limit": 1}))
+            check("min_rep_hr=0 skips the heart-rate test (warm-up counted too)",
+                  no_hr["sessions"][-1]["left_out"]["easy_running"] == 0
+                  and sum(x["rep_count"] for x in no_hr["sessions"][-1]["rep_sets"]) > 4)
 
             print("\n6. easy_pace_trend")
             ep = payload(await s.call_tool("easy_pace_trend", {"weeks": 12}))
@@ -142,6 +193,14 @@ async def main():
             half = ep["earlier_vs_recent"]
             check("recent easy GAP quicker than earlier in the improving mock",
                   secs(half["recent"]["mean_gap_min_km"]) < secs(half["earlier"]["mean_gap_min_km"]), half)
+            check("earlier_vs_recent pools runs and says how many",
+                  all(k in half["recent"] for k in ("runs", "km", "mean_pace_min_km", "mean_hr")), half)
+            light = ep.get("light_weeks") or []
+            light_rows = [wk for wk in ep["weekly"] if wk["week_start"] in light]
+            print(f"     light weeks: {light_rows}")
+            check("marathon-recovery week (one 2km jog) stays in the table but is flagged light",
+                  len(light_rows) >= 1 and any(wk["runs"] == 1 for wk in light_rows), light)
+            check("normal weeks are not flagged", len(light_rows) < len(ep["weekly"]) / 2)
             strict = payload(await s.call_tool("easy_pace_trend", {"weeks": 12, "max_hr": 120}))
             check("lower max_hr leaves more runs out",
                   strict["runs_left_out"]["above_max_hr"] > ep["runs_left_out"]["above_max_hr"])
