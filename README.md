@@ -1,6 +1,6 @@
 # intervals-icu MCP server
 
-Puts your intervals.icu training data behind six tools that Claude can call
+Puts your intervals.icu training data behind eight tools that Claude can call
 directly — no CSV exports, no synced folders, no dependency on your laptop
 being awake.
 
@@ -13,12 +13,14 @@ Claude  ──HTTPS──>  this server (Northflank)  ──HTTPS──>  interv
 
 | Tool | What it does |
 |---|---|
+| `race_history(name_contains)` | Every race and time trial, oldest first: distance, finish time, pace, grade-adjusted pace. The main running progress measure. |
+| `compare_sessions(name_contains, rep_seconds, ...)` | The same workout across dates, rep by rep: pace, grade-adjusted pace and HR of each work rep. |
+| `easy_pace_trend(weeks, max_hr, name_contains, ...)` | Easy runs only: weekly grade-adjusted pace and HR as separate columns. |
 | `training_summary(weeks)` | Weekly volume by sport, plus current fitness (CTL), fatigue (ATL) and form. The default overview. |
-| `list_activities(days, activity_type, limit)` | Recent sessions with distance, pace (runs) or speed (bikes), HR, watts, load. |
+| `list_activities(days, activity_type, limit)` | Recent sessions with distance, pace and grade-adjusted pace (runs) or speed (bikes), HR, elevation per km, watts, load. |
 | `activity_detail(activity_id)` | One session in full, including rep-by-rep splits where they exist. |
 | `wellness(days)` | Resting HR, HRV, sleep, weight — plus whether they're trending. |
-| `pace_at_hr_trend(weeks, activity_type, min_hr, max_hr)` | Runs: whether pace at a given HR is improving, flat or declining. Refuses bikes. |
-| `power_at_hr_trend(weeks, activity_type, min_hr, max_hr, environment, include_estimated_power)` | Bikes: whether power at a given HR (efficiency factor) is improving, flat or declining. |
+| `power_at_hr_trend(weeks, activity_type, min_hr, max_hr, environment, include_estimated_power)` | Bikes: whether power at a given HR (efficiency factor) is improving, flat or declining. Parked until there's enough bike history to read. |
 
 ### Sports are normalised
 
@@ -35,26 +37,62 @@ showing the raw split. Any `activity_type` filter is normalised the same way, so
 `"Bike"`, `"Ride"` and `"VirtualRide"` all match indoor and outdoor rides
 together. Unlisted types (Tennis, WeightTraining...) stay as their own sport.
 
-### The trend tools
+### Running: three direct measures, no composite index
 
-`pace_at_hr_trend` is the one worth understanding. Speed per heartbeat is the
-honest read on aerobic fitness for running, but it moves with session *mix* as
-well as fitness, so:
+An earlier version combined pace and heart rate into one "efficiency index".
+It was removed: route hills moved it more than fitness did. Pace and heart rate
+are now always reported as separate columns.
 
-- Pass `min_hr` / `max_hr` to compare like with like (`min_hr=140` for
-  sub-threshold work, `max_hr=130` for easy running).
-- Without a band, the response carries a `confound_warning` when weekly mean HR
-  is unstable — that means you're reading session mix, not fitness.
-- Weeks clipped by the window edge are dropped rather than averaged in.
-- The flat band is ±2%, deliberately wide. Efficiency swings on heat, hills and
-  terrain; anything smaller is noise.
-- Weekly means are weighted by session duration, so a long run counts for more
-  than a short jog. Weekly pace is total time over total distance.
-- It refuses bike types. Bike speed is dominated by gradient, wind, drafting and
-  position, so speed per heartbeat is not a fitness signal on a bike, and a
-  plausible-looking number would be worse than an error.
+**Grade-adjusted pace everywhere.** intervals.icu computes grade-adjusted pace
+(`gap`, using Strava's run model) for every outdoor run and every interval. Every
+run tool reports it as `gap_min_km` next to the raw `pace_min_km`; GAP is the one
+to compare across routes. Treadmill runs have no GAP (no hills), so they use
+plain pace where a GAP figure is needed. Every run row also has
+`elevation_m_per_km` — 0 is flat, 10+ is a properly hilly route — so you can see at
+a glance whether two runs are comparable.
 
-`power_at_hr_trend` is the bike equivalent. Per week it reports
+**`race_history`** lists races and time trials, oldest first, with finish time
+(elapsed, as races are timed), pace, GAP and a standard distance label (5k, 10k,
+half, marathon, within 3%). intervals.icu has a `race` flag on each activity;
+runs with it ticked are included, as are runs named with "race", "marathon",
+"parkrun", "time trial" or "TT". Session names like "Perth - 5k" are *not*
+treated as races. Tick the race box in intervals.icu to make sure a result is
+picked up; `name_contains` adds unusually named results.
+
+**`compare_sessions`** compares one workout across dates, rep by rep. What
+intervals.icu returns for a rep session is messier than "reps and recoveries":
+warm-up and cool-down kilometres are typed `WORK` too, and lap-button presses
+appear as 1-second recoveries. So reps are picked out in three steps:
+
+1. Drop anything typed `RECOVERY`.
+2. Drop anything shorter than `min_rep_seconds` (default 90s): strides, lap taps.
+3. Drop easy running by heart rate. intervals.icu groups similar laps; a group
+   only counts as reps if its average HR is above `min_rep_hr`, by default the top
+   of zone 1 from your intervals.icu settings. Judging by the group rather than
+   each lap keeps a first rep whose HR is still climbing. A rep with a heart-rate
+   dropout can be dropped this way; each session's `left_out` counts show what was
+   excluded and why.
+
+Reps of different lengths are never averaged together. `rep_seconds` keeps only
+reps of about that length (±`tolerance_pct`, default 15%); without it, each
+session's reps are split into sets of similar length and reported separately.
+Set averages are weighted by rep duration. `comparison` gives one line per set,
+oldest first.
+
+**`easy_pace_trend`** reports weekly GAP, raw pace, HR, km and elevation per km
+for easy runs. A run counts as easy when its average HR is at or below `max_hr`
+(default: top of zone 1) *and* no more than `max_pct_above_easy_zone` (default 10%)
+of it was spent above zone 1. The second test matters for Norwegian-singles
+training: warm-up, cool-down and recoveries pull a sub-threshold session's
+*average* HR under the easy ceiling even though a third or more of it was hard
+running. On real data every such session had 31%+ of its time above zone 1, and
+46 of 53 easy runs had none. Weekly figures are duration-weighted; clipped edge
+weeks are dropped; `earlier_vs_recent` sets the first half of the window against
+the second, pace and HR side by side. `name_contains` restricts it to one route.
+
+### Bikes (parked)
+
+`power_at_hr_trend` is the bike trend tool. Per week it reports
 `efficiency_factor` = duration-weighted normalised power ÷ duration-weighted
 average HR — the same EF intervals.icu shows per activity — with the same
 verdict block, ±2% band, partial-week dropping and HR confound warning.
@@ -94,13 +132,16 @@ verdict block, ±2% band, partial-week dropping and HR confound warning.
 
 ## Future work
 
+Deliberately not built yet:
+
 - **eFTP and the power-duration curve.** Expose intervals.icu's eFTP and power
   curve. Becomes the primary bike progression metric once a real FTP test
   anchors it.
-- **Decoupling / Pw:HR drift on long rides.** The standard aerobic-durability
-  measure. intervals.icu already computes `decoupling` per activity; it needs a
-  trend tool restricted to long steady rides. Needed once 4–6 hour rides are
-  routine.
+- **Aerobic decoupling (Pw:HR / Pa:HR drift) on long sessions.** The standard
+  aerobic-durability measure. intervals.icu already computes `decoupling` per
+  activity; it needs a trend tool restricted to long steady sessions.
+- **Variability index** (normalised ÷ average power) for judging how evenly a
+  ride was paced.
 - **Swim units.** Swims still report `pace_min_km`; pace per 100m would suit them
   better.
 
@@ -200,7 +241,7 @@ so the suite runs without touching the real API or needing a key. It also counts
 requests, which is how the cache tests prove calls are actually being avoided.
 
 ```bash
-# terminal 1 — improving block
+# terminal 1
 python -m uvicorn mock_intervals:app --port 9001
 
 # terminal 2
@@ -211,20 +252,22 @@ python server.py
 # terminal 3
 python test_server.py
 python test_bike.py
-python test_cache.py     # needs the server started with CACHE_TTL_SECONDS=3 and MOCK_DRIFT unset
-
-# then restart the mock with MOCK_DRIFT=0.006 (a declining block) and run:
-python test_trend.py
+python test_run.py
+python test_cache.py     # needs the server restarted with CACHE_TTL_SECONDS=3
 ```
 
 - `test_server.py` — secret path, tool discovery, every tool's shape, bad input.
 - `test_bike.py` — sport normalisation in summaries and filters, speed vs pace
-  units, the pace-trend bike guard, `power_at_hr_trend` (measured-only default,
-  exclusion counts, EF definition, duration weighting, environment and
-  estimated-power flags), and steady rides reported as "no distinct efforts".
-- `test_trend.py` — that a declining block reads as declining, partial weeks are
-  dropped, a shifting session mix raises the confound warning, and thin data
-  produces no verdict rather than a confident wrong one.
+  units, `power_at_hr_trend` (measured-only default, exclusion counts, EF
+  definition, duration weighting, environment and estimated-power flags), and
+  steady rides reported as "no distinct efforts".
+- `test_run.py` — GAP and elevation per km on run rows; `race_history` (race flag,
+  names, sessions like "3k" not mistaken for races, `name_contains`);
+  `compare_sessions` (exactly the work reps: recoveries, strides, warm-up and
+  cool-down left out and counted, lagging first rep kept, rep lengths never mixed,
+  `rep_seconds` filter); `easy_pace_trend` (zone-1 defaults, rep sessions kept out
+  even when their average HR is under the ceiling, separate pace and HR columns,
+  route filter).
 - `test_cache.py` — that repeats avoid the network, distinct arguments don't
   collide, concurrent calls don't stampede, the TTL expires, and failures are
   never cached.

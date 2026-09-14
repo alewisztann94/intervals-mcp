@@ -64,11 +64,13 @@ if not SECRET_PATH:
 mcp = FastMCP(
     "intervals-icu",
     instructions=(
-        "Training data from intervals.icu for a single athlete. Use training_summary for the overview, "
-        "pace_at_hr_trend (run) or power_at_hr_trend (bike) to check whether aerobic fitness is "
-        "drifting, and wellness for recovery signals. Sports are normalised: 'Bike' covers indoor and "
-        "outdoor rides, 'Run' covers treadmill and trail. All distances are km, durations minutes, "
-        "run paces min/km, bike speeds km/h."
+        "Training data from intervals.icu for a single athlete. For running progress: race_history "
+        "(races and time trials, the primary progress measure), compare_sessions (the same workout "
+        "across dates, rep by rep) and easy_pace_trend (easy-run pace and heart rate by week). "
+        "training_summary gives the volume overview and wellness the recovery signals. "
+        "Run paces are min/km; gap_min_km is grade-adjusted pace (corrected for hills) and is the "
+        "one to compare across routes. elevation_m_per_km shows how hilly a run was. Sports are "
+        "normalised: 'Bike' covers indoor and outdoor rides, 'Run' covers treadmill and trail."
     ),
     host="0.0.0.0",
     port=PORT,
@@ -206,6 +208,41 @@ def _speed_kmh(distance_m: Any, seconds: Any) -> float | None:
     return round(dist / secs * 3.6, 1)
 
 
+def _pace_from_speed(m_per_s: Any) -> str | None:
+    """m/s -> min/km as m:ss. intervals.icu reports GAP as a speed."""
+    speed = _num(m_per_s)
+    if not speed or speed <= 0:
+        return None
+    s_per_km = 1000 / speed
+    return f"{int(s_per_km // 60)}:{int(s_per_km % 60):02d}"
+
+
+def _elev_per_km(gain_m: Any, distance_m: Any) -> float | None:
+    """Metres climbed per km: 0 is flat, 10+ is a properly hilly route."""
+    gain, dist = _num(gain_m), _num(distance_m)
+    if gain is None or not dist or dist < 100:
+        return None
+    return round(gain / (dist / 1000), 1)
+
+
+def _duration(seconds: Any) -> str | None:
+    secs = _num(seconds)
+    if secs is None:
+        return None
+    secs = int(round(secs))
+    h, rem = divmod(secs, 3600)
+    return f"{h}:{rem // 60:02d}:{rem % 60:02d}" if h else f"{rem // 60}:{rem % 60:02d}"
+
+
+async def _easy_hr_ceiling() -> int | None:
+    """Top of heart-rate zone 1 from the athlete's intervals.icu run settings."""
+    athlete = await fetch(f"/athlete/{ATHLETE}")
+    for settings in (athlete or {}).get("sportSettings") or []:
+        if "Run" in (settings.get("types") or []) and settings.get("hr_zones"):
+            return int(settings["hr_zones"][0])
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Sports
 # --------------------------------------------------------------------------- #
@@ -262,7 +299,11 @@ def _activity_row(act: dict) -> dict:
         "minutes": round((_num(act.get("moving_time")) or 0) / 60, 1) or None,
         # Pace is meaningless on a bike; speed is the unit riders read.
         "pace_min_km": None if bike else _pace(act.get("distance"), act.get("moving_time")),
+        # Grade-adjusted pace: what the pace would have been on the flat. Null on a
+        # treadmill, which has no hills to adjust for.
+        "gap_min_km": _pace_from_speed(act.get("gap")) if sport == "Run" else None,
         "speed_kmh": _speed_kmh(act.get("distance"), act.get("moving_time")) if bike else None,
+        "elevation_m_per_km": _elev_per_km(act.get("total_elevation_gain"), act.get("distance")),
         "avg_hr": _num(act.get("average_heartrate")),
         "max_hr": _num(act.get("max_heartrate")),
         "avg_watts": _num(act.get("icu_average_watts")),
@@ -274,7 +315,7 @@ def _activity_row(act: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Trend helpers shared by pace_at_hr_trend and power_at_hr_trend
+# Trend helpers shared by easy_pace_trend and power_at_hr_trend
 # --------------------------------------------------------------------------- #
 
 def _wmean(pairs: list[tuple[float, float]]) -> float:
@@ -503,7 +544,9 @@ async def activity_detail(activity_id: str) -> dict:
                     "seconds": secs,
                     "km": round((_num(it.get("distance")) or 0) / 1000, 3) or None,
                     "pace_min_km": None if bike else _pace(it.get("distance"), secs),
+                    "gap_min_km": _pace_from_speed(it.get("gap")) if summary["sport"] == "Run" else None,
                     "speed_kmh": _speed_kmh(it.get("distance"), secs) if bike else None,
+                    "elevation_m_per_km": _elev_per_km(it.get("total_elevation_gain"), it.get("distance")),
                     "avg_hr": _num(it.get("average_heartrate")),
                     "avg_watts": _num(it.get("average_watts")),
                     "np_watts": _num(it.get("weighted_average_watts")),
@@ -580,56 +623,328 @@ async def wellness(days: int = 30) -> dict:
     }
 
 
+RACE_NAME = re.compile(r"\b(race|marathon|parkrun|time[\s-]?trial|tt)\b", re.IGNORECASE)
+
+STANDARD_DISTANCES = [(5000, "5k"), (10000, "10k"), (21097.5, "Half marathon"), (42195, "Marathon")]
+
+
+def _standard_distance(distance_m: float | None) -> str | None:
+    """Name the standard race distance a GPS distance is within 3% of, if any."""
+    if not distance_m:
+        return None
+    for metres, label in STANDARD_DISTANCES:
+        if abs(distance_m - metres) / metres <= 0.03:
+            return label
+    return None
+
+
 @mcp.tool()
-async def pace_at_hr_trend(
-    weeks: int = 12,
-    activity_type: str = "Run",
-    min_hr: int | None = None,
-    max_hr: int | None = None,
+async def race_history(name_contains: str | None = None) -> dict:
+    """Every race and time trial on record, oldest first — the main measure of running progress.
+
+    Just call it with no arguments. A run counts as a race if it is ticked as a
+    race in intervals.icu, or if its name contains "race", "marathon", "parkrun",
+    "time trial" or "TT". Ticking the race box in intervals.icu is the reliable
+    way to make sure a result shows up here.
+
+    finish_time uses elapsed time (the clock keeps running when you stop), which
+    is how races are timed. gap_min_km is grade-adjusted pace, so a hilly course
+    and a flat one can be compared; elevation_m_per_km shows how hilly it was.
+
+    Args:
+        name_contains: Also include runs whose name contains this text, for
+            results that aren't named like races (e.g. "Perth - 5k TT").
+    """
+    activities = await fetch(f"/athlete/{ATHLETE}/activities", {"oldest": "2000-01-01", "newest": _window(0)[1]})
+    if not isinstance(activities, list):
+        return {"error": "unexpected activities payload"}
+
+    extra = (name_contains or "").strip().lower()
+    rows = []
+    for act in activities:
+        if not _same_sport(act, "Run"):
+            continue
+        name = str(act.get("name") or "")
+        if act.get("race") is True:
+            found_by = "race flag"
+        elif RACE_NAME.search(name):
+            found_by = "name"
+        elif extra and extra in name.lower():
+            found_by = "name_contains"
+        else:
+            continue
+        dist = _num(act.get("distance"))
+        elapsed = _num(act.get("elapsed_time")) or _num(act.get("moving_time"))
+        d = _act_date(act)
+        rows.append(
+            {
+                "date": d.isoformat() if d else None,
+                "name": name,
+                "distance_km": round(dist / 1000, 2) if dist else None,
+                "standard_distance": _standard_distance(dist),
+                "finish_time": _duration(elapsed),
+                "pace_min_km": _pace(dist, elapsed),
+                "gap_min_km": _pace_from_speed(act.get("gap")),
+                "avg_hr": _num(act.get("average_heartrate")),
+                "elevation_m_per_km": _elev_per_km(act.get("total_elevation_gain"), dist),
+                "found_by": found_by,
+                "id": act.get("id"),
+            }
+        )
+    rows.sort(key=lambda r: r["date"] or "")
+    return {
+        "count": len(rows),
+        "races": rows,
+        "note": None if rows else (
+            "No races found. Tick 'race' on the activity in intervals.icu, or pass name_contains."
+        ),
+    }
+
+
+@mcp.tool()
+async def compare_sessions(
+    name_contains: str,
+    rep_seconds: int | None = None,
+    tolerance_pct: int = 15,
+    min_rep_hr: int | None = None,
+    min_rep_seconds: int = 90,
+    days: int = 365,
+    limit: int = 10,
 ) -> dict:
-    """Track whether pace at a given heart rate is improving or drifting.
+    """Compare the same workout across dates, rep by rep (pace and heart rate of every rep).
 
-    This is the honest fitness signal: for aerobic work, getting faster at the
-    same HR means the engine is improving; getting slower at the same HR over
-    several weeks means fatigue is accumulating faster than it's being absorbed.
+    Finds runs whose name contains name_contains (e.g. "Perth - 3k"), then pulls
+    out the work reps only. Recoveries, warm-up and cool-down are left out, because
+    an average that includes them measures how long you rested, not how fit you are.
 
-    IMPORTANT: compare like with like. Mixing easy runs and hard sessions makes
-    this metric move with weekly session *composition* rather than fitness, so
-    pass min_hr/max_hr to confine the analysis to one kind of session — e.g.
-    min_hr=140 for sub-threshold work, or max_hr=130 for easy running. Without
-    a band the result carries a confound warning when weekly mean HR is unstable.
+    How reps are picked out of the recording:
+      - Recovery blocks are dropped.
+      - Anything shorter than min_rep_seconds (default 90s) is dropped: lap-button
+        taps, strides and short jogs aren't reps.
+      - Warm-up and cool-down kilometres are dropped by heart rate: a group of
+        similar laps only counts as reps if its average HR is above min_rep_hr.
+        By default that is the top of your easy zone (zone 1) from intervals.icu,
+        so easy running never counts as a rep. A rep recorded with a heart-rate
+        dropout can be left out this way; left_out counts everything dropped.
 
-    Not for bikes: bike speed is dominated by gradient, wind, drafting and
-    position, so use power_at_hr_trend for rides.
+    Reps of different lengths are never averaged together, because a 1km rep
+    and a 6-minute rep are run at different paces at the same fitness. Pass
+    rep_seconds to keep only reps of about that length (e.g. rep_seconds=270 for
+    1km reps at about 4:30, or 360 for 6-minute reps). Without it, each session's
+    reps are split into sets of similar length and reported separately.
 
-    Weekly means are weighted by session duration, and weekly pace is total time
-    over total distance, so a long run counts for more than a short jog.
+    Each rep has pace, gap_min_km (grade-adjusted pace — compare this one across
+    days on different routes) and HR. Set averages are weighted by rep duration.
+
+    Args:
+        name_contains: Text the run's name must contain, case-insensitive, e.g. "Perth - 3k".
+        rep_seconds: Only keep reps lasting about this many seconds.
+        tolerance_pct: How far a rep may be from rep_seconds and still count, in percent (default 15).
+        min_rep_hr: Heart rate a group of laps must average above to count as reps.
+            Defaults to the top of zone 1 in your intervals.icu run settings.
+        min_rep_seconds: Ignore anything shorter than this (default 90).
+        days: How far back to search (default 365).
+        limit: Compare at most this many sessions, the most recent (default 10).
+    """
+    needle = name_contains.strip().lower()
+    if not needle:
+        raise ValueError("name_contains is required, e.g. 'Perth - 3k'.")
+    days = max(1, min(days, 1500))
+    limit = max(1, min(limit, 30))
+    tolerance = max(1, min(tolerance_pct, 50)) / 100
+    if min_rep_hr is None:
+        min_rep_hr = await _easy_hr_ceiling()
+
+    oldest, newest = _window(days)
+    activities = await fetch(f"/athlete/{ATHLETE}/activities", {"oldest": oldest, "newest": newest})
+    if not isinstance(activities, list):
+        return {"error": "unexpected activities payload"}
+    matches = [
+        a for a in activities
+        if _same_sport(a, "Run") and needle in str(a.get("name") or "").lower()
+    ]
+    matches.sort(key=lambda a: str(a.get("start_date_local") or ""))
+    matches = matches[-limit:]
+
+    async def intervals_for(act: dict) -> list[dict]:
+        try:
+            payload = await fetch(f"/activity/{act['id']}/intervals")
+        except RuntimeError:
+            return []
+        return [it for it in (payload or {}).get("icu_intervals") or [] if isinstance(it, dict)]
+
+    all_intervals = await asyncio.gather(*(intervals_for(a) for a in matches))
+
+    sessions = []
+    comparison = []
+    for act, items in zip(matches, all_intervals):
+        reps, excluded = _pick_reps(items, min_rep_seconds, min_rep_hr)
+        if rep_seconds:
+            keep = [r for r in reps if abs(r["seconds"] - rep_seconds) <= rep_seconds * tolerance]
+            excluded["other_length"] = len(reps) - len(keep)
+            sets = [keep] if keep else []
+        else:
+            sets = _split_by_length(reps, tolerance)
+
+        d = _act_date(act)
+        session_sets = []
+        for rep_set in sets:
+            summary = _set_summary(rep_set)
+            session_sets.append({**summary, "reps": [_rep_row(r) for r in rep_set]})
+            comparison.append({"date": d.isoformat() if d else None, **summary,
+                               "session_elevation_m_per_km": _elev_per_km(act.get("total_elevation_gain"),
+                                                                          act.get("distance"))})
+        sessions.append(
+            {
+                "date": d.isoformat() if d else None,
+                "name": act.get("name"),
+                "id": act.get("id"),
+                "elevation_m_per_km": _elev_per_km(act.get("total_elevation_gain"), act.get("distance")),
+                "rep_sets": session_sets,
+                "left_out": excluded,
+            }
+        )
+
+    return {
+        "name_contains": name_contains,
+        "rep_filter": {
+            "rep_seconds": rep_seconds,
+            "tolerance_pct": round(tolerance * 100) if rep_seconds else None,
+            "min_rep_hr": min_rep_hr,
+            "min_rep_seconds": min_rep_seconds,
+        },
+        "sessions_found": len(sessions),
+        # One line per set of reps, oldest first: the quick read.
+        "comparison": comparison,
+        "sessions": sessions,
+        "note": None if sessions else f"No runs in the last {days} days have a name containing '{name_contains}'.",
+    }
+
+
+def _pick_reps(items: list[dict], min_seconds: int, min_hr: int | None) -> tuple[list[dict], dict]:
+    """Work reps from intervals.icu's intervals, plus a count of what was left out and why."""
+    excluded = {"recovery": 0, "too_short": 0, "easy_running": 0}
+    work = []
+    for n, it in enumerate(items, start=1):
+        secs = _num(it.get("elapsed_time")) or _num(it.get("moving_time"))
+        if str(it.get("type") or "").upper() != "WORK":
+            excluded["recovery"] += 1
+        elif not secs or secs < min_seconds or not _num(it.get("distance")):
+            excluded["too_short"] += 1
+        else:
+            work.append({**it, "seconds": secs, "position": n})
+
+    # intervals.icu groups laps that look alike (similar length and effort). Judge
+    # easy vs rep by the group's average HR, so a first rep whose HR is still
+    # climbing isn't mistaken for warm-up.
+    by_group: dict[Any, list[dict]] = defaultdict(list)
+    for w in work:
+        by_group[w.get("group_id") or f"solo-{w['position']}"].append(w)
+    reps = []
+    for members in by_group.values():
+        hrs = [(_num(m.get("average_heartrate")), m["seconds"]) for m in members]
+        hrs = [(h, s) for h, s in hrs if h]
+        group_hr = _wmean(hrs) if hrs else None
+        if min_hr is not None and (group_hr is None or group_hr <= min_hr):
+            excluded["easy_running"] += len(members)
+        else:
+            reps.extend(members)
+    reps.sort(key=lambda r: r["position"])
+    return reps, excluded
+
+
+def _split_by_length(reps: list[dict], tolerance: float) -> list[list[dict]]:
+    """Split reps into sets of similar duration (within tolerance of the set's first rep)."""
+    sets: list[list[dict]] = []
+    for rep in sorted(reps, key=lambda r: r["seconds"]):
+        if sets and rep["seconds"] <= sets[-1][0]["seconds"] * (1 + tolerance):
+            sets[-1].append(rep)
+        else:
+            sets.append([rep])
+    for s in sets:
+        s.sort(key=lambda r: r["position"])
+    return sorted(sets, key=lambda s: -len(s))
+
+
+def _set_summary(rep_set: list[dict]) -> dict:
+    secs = sum(r["seconds"] for r in rep_set)
+    dist = sum(_num(r.get("distance")) or 0 for r in rep_set)
+    gaps = [(_num(r.get("gap")), r["seconds"]) for r in rep_set if _num(r.get("gap"))]
+    hrs = [(_num(r.get("average_heartrate")), r["seconds"]) for r in rep_set if _num(r.get("average_heartrate"))]
+    return {
+        "rep_count": len(rep_set),
+        "typical_rep_seconds": round(statistics.median(r["seconds"] for r in rep_set)),
+        "typical_rep_km": round(statistics.median(_num(r.get("distance")) or 0 for r in rep_set) / 1000, 2),
+        "mean_pace_min_km": _pace(dist, secs),
+        "mean_gap_min_km": _pace_from_speed(_wmean(gaps)) if gaps else None,
+        "mean_hr": round(_wmean(hrs), 1) if hrs else None,
+    }
+
+
+def _rep_row(rep: dict) -> dict:
+    return {
+        "seconds": round(rep["seconds"]),
+        "km": round((_num(rep.get("distance")) or 0) / 1000, 2),
+        "pace_min_km": _pace(rep.get("distance"), rep["seconds"]),
+        "gap_min_km": _pace_from_speed(rep.get("gap")),
+        "avg_hr": _num(rep.get("average_heartrate")),
+        "elevation_m_per_km": _elev_per_km(rep.get("total_elevation_gain"), rep.get("distance")),
+    }
+
+
+@mcp.tool()
+async def easy_pace_trend(
+    weeks: int = 12,
+    max_hr: int | None = None,
+    name_contains: str | None = None,
+    max_pct_above_easy_zone: int = 10,
+) -> dict:
+    """Weekly pace and heart rate on easy runs — are easy runs getting quicker at the same effort?
+
+    Uses easy runs only. A run counts as easy when both are true:
+      - its average heart rate is at or below max_hr. By default that's the top of
+        your easy zone (zone 1) from your intervals.icu settings; lower it to be stricter.
+      - no more than max_pct_above_easy_zone percent (default 10%) of the run was
+        spent above zone 1. This is what keeps interval sessions out: warm-up,
+        cool-down and recoveries can pull a session's AVERAGE heart rate under the
+        ceiling even though a third or more of it was hard running.
+
+    Pace and heart rate are separate columns — they are not combined into one
+    number. Read them together: pace getting quicker while HR holds steady is
+    progress; quicker pace with HR also rising is not.
+
+    gap_min_km is grade-adjusted pace (corrected for hills) and is the column to
+    watch, because it doesn't jump around when you change route.
+    elevation_m_per_km shows how hilly that week's easy running was. To compare
+    one route only, pass its name in name_contains (e.g. "Perth Running").
+
+    Weekly figures are weighted by duration, so a long run counts for more than
+    a short one. Treadmill runs have no grade-adjusted pace and use their plain
+    pace in the GAP column. Weeks cut short by the edge of the window are dropped.
 
     Args:
         weeks: How many weeks back (2-52).
-        activity_type: Sport to analyse, e.g. "Run" (covers Run, VirtualRun, TrailRun).
-        min_hr: Only include sessions with average HR at or above this.
-        max_hr: Only include sessions with average HR at or below this.
+        max_hr: Heart-rate ceiling for an easy run's average. Defaults to the top of zone 1 in intervals.icu.
+        name_contains: Only include runs whose name contains this text, e.g. "Perth Running".
+        max_pct_above_easy_zone: Most of a run, in percent, that may be above heart-rate
+            zone 1 for it to still count as easy (default 10).
     """
-    sport = canonical_sport(activity_type)
-    if sport == "Bike":
-        raise ValueError(
-            f"pace_at_hr_trend does not analyse bike activities ('{activity_type}'). Bike speed is "
-            "dominated by gradient, wind, drafting and position, so speed per heartbeat is not a "
-            "fitness signal on a bike. Use power_at_hr_trend instead."
-        )
-
     weeks = max(2, min(weeks, 52))
+    if max_hr is None:
+        max_hr = await _easy_hr_ceiling()
+        if max_hr is None:
+            raise ValueError("No heart-rate zones found in intervals.icu run settings; pass max_hr.")
     oldest, newest = _window(weeks * 7)
     activities = await fetch(f"/athlete/{ATHLETE}/activities", {"oldest": oldest, "newest": newest})
     if not isinstance(activities, list):
         return {"error": "unexpected activities payload"}
 
+    needle = (name_contains or "").strip().lower()
     per_week: dict[date, list[dict]] = defaultdict(list)
-    excluded_by_band = 0
+    left_out = {"above_max_hr": 0, "too_much_time_above_easy_zone": 0, "name_mismatch": 0}
 
     for act in activities:
-        if not _same_sport(act, sport):
+        if not _same_sport(act, "Run"):
             continue
         d = _act_date(act)
         hr = _num(act.get("average_heartrate"))
@@ -637,16 +952,27 @@ async def pace_at_hr_trend(
         secs = _num(act.get("moving_time"))
         if not d or not hr or not dist or not secs or dist < 2000:
             continue
-        if (min_hr is not None and hr < min_hr) or (max_hr is not None and hr > max_hr):
-            excluded_by_band += 1
+        if needle and needle not in str(act.get("name") or "").lower():
+            left_out["name_mismatch"] += 1
             continue
-        speed_m_s = dist / secs
+        if hr > max_hr:
+            left_out["above_max_hr"] += 1
+            continue
+        zone_times = act.get("icu_hr_zone_times")
+        if isinstance(zone_times, list) and zone_times:
+            above = sum(_num(z) or 0 for z in zone_times[1:])
+            if above / secs * 100 > max_pct_above_easy_zone:
+                left_out["too_much_time_above_easy_zone"] += 1
+                continue
+        gap = _num(act.get("gap"))
         per_week[_week_start(d)].append(
             {
-                "ef": (speed_m_s * 60) / hr,  # metres per beat-ish; comparable within sport
                 "hr": hr,
                 "secs": secs,
-                "km": dist / 1000,
+                "dist": dist,
+                "gap": gap or dist / secs,
+                "no_gap": gap is None,
+                "gain": _num(act.get("total_elevation_gain")) or 0,
             }
         )
 
@@ -655,33 +981,55 @@ async def pace_at_hr_trend(
     series = []
     for wk in sorted(per_week):
         rows = per_week[wk]
-        km = sum(r["km"] for r in rows)
-        mean_s_km = sum(r["secs"] for r in rows) / km
+        dist = sum(r["dist"] for r in rows)
+        secs = sum(r["secs"] for r in rows)
         series.append(
             {
                 "week_start": wk.isoformat(),
-                "sessions": len(rows),
-                "km": round(km, 1),
+                "runs": len(rows),
+                "km": round(dist / 1000, 1),
+                "hours": round(secs / 3600, 1),
+                "mean_gap_min_km": _pace_from_speed(_wmean([(r["gap"], r["secs"]) for r in rows])),
+                "mean_pace_min_km": _pace(dist, secs),
                 "mean_hr": round(_wmean([(r["hr"], r["secs"]) for r in rows]), 1),
-                "mean_pace_min_km": f"{int(mean_s_km // 60)}:{int(mean_s_km % 60):02d}",
-                "efficiency_index": round(_wmean([(r["ef"], r["secs"]) for r in rows]), 3),
+                "elevation_m_per_km": _elev_per_km(sum(r["gain"] for r in rows), dist),
+                "treadmill_runs": sum(r["no_gap"] for r in rows),
             }
         )
 
     return {
-        "sport": sport,
         "window": {"from": oldest, "to": newest, "weeks": weeks},
-        "hr_band": {"min_hr": min_hr, "max_hr": max_hr, "sessions_excluded": excluded_by_band},
+        "filters": {
+            "max_hr": max_hr,
+            "max_pct_above_easy_zone": max_pct_above_easy_zone,
+            "name_contains": name_contains,
+        },
+        "runs_left_out": left_out,
         "partial_weeks_dropped": dropped_partial or None,
         "weekly": series,
-        "verdict": _verdict(series, "efficiency_index"),
-        "confound_warning": _hr_confound(series, min_hr, max_hr),
-        "caveat": (
-            "efficiency_index is speed per heartbeat and is only comparable within the "
-            "same sport, session type and broadly similar terrain and conditions. Heat, "
-            "hills and session mix all move it. Read trends over weeks, never single sessions."
-        ),
+        "earlier_vs_recent": _halves(series),
     }
+
+
+def _halves(series: list[dict]) -> dict | None:
+    """First half of the weeks against the second half, pace and HR side by side."""
+    if len(series) < 4:
+        return None
+    half = len(series) // 2
+
+    def summarise(weeks: list[dict]) -> dict:
+        def to_secs(p: str) -> int:
+            m, s = p.split(":")
+            return int(m) * 60 + int(s)
+
+        gap_secs = statistics.mean(to_secs(w["mean_gap_min_km"]) for w in weeks)
+        return {
+            "weeks": f"{weeks[0]['week_start']} to {weeks[-1]['week_start']}",
+            "mean_gap_min_km": f"{int(gap_secs // 60)}:{int(gap_secs % 60):02d}",
+            "mean_hr": round(statistics.mean(w["mean_hr"] for w in weeks), 1),
+        }
+
+    return {"earlier": summarise(series[:half]), "recent": summarise(series[half:])}
 
 
 @mcp.tool()

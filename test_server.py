@@ -56,10 +56,10 @@ async def main() -> None:
             expected = sorted(
                 [
                     "training_summary", "list_activities", "activity_detail", "wellness",
-                    "pace_at_hr_trend", "power_at_hr_trend",
+                    "race_history", "compare_sessions", "easy_pace_trend", "power_at_hr_trend",
                 ]
             )
-            check("all six tools exposed", names == expected, str(names))
+            check("all eight tools exposed", names == expected, str(names))
             check(
                 "every tool has a description",
                 all((t.description or "").strip() for t in tools.tools),
@@ -83,7 +83,7 @@ async def main() -> None:
             print("\n4. list_activities")
             res = payload(await session.call_tool("list_activities", {"days": 10, "activity_type": "Run"}))
             check("returns rows", res["count"] > 0, str(res["count"]))
-            check("filter applied", all(a["type"] == "Run" for a in res["activities"]))
+            check("filter applied", all(a["sport"] == "Run" for a in res["activities"]))
             first = res["activities"][0]
             print(f"     newest: {first['date']} {first['km']}km @ {first['pace_min_km']} hr {first['avg_hr']}")
             check("pace computed", first["pace_min_km"] is not None)
@@ -96,8 +96,10 @@ async def main() -> None:
 
             print("\n6. activity_detail — structured session")
             res = payload(await session.call_tool("list_activities", {"days": 7, "activity_type": "Run"}))
-            hard = next((a for a in res["activities"] if a["avg_hr"] and a["avg_hr"] > 140), None)
-            check("found a hard run to inspect", hard is not None)
+            # A session's average HR sits under the easy ceiling (warm-up and recoveries
+            # dilute it), so find one by name rather than by HR.
+            hard = next((a for a in res["activities"] if " - " in (a["name"] or "")), None)
+            check("found a rep session to inspect", hard is not None)
             if hard:
                 det = payload(await session.call_tool("activity_detail", {"activity_id": hard["id"]}))
                 check("intervals returned", len(det["intervals"]) > 0, str(len(det["intervals"])))
@@ -120,17 +122,11 @@ async def main() -> None:
             check("trend computed", res["trends"]["resting_hr"] is not None)
             print(f"     resting hr trend: {res['trends']['resting_hr']}")
 
-            print("\n9. pace_at_hr_trend")
-            res = payload(await session.call_tool("pace_at_hr_trend", {"weeks": 12, "activity_type": "Run"}))
+            print("\n9. easy_pace_trend")
+            res = payload(await session.call_tool("easy_pace_trend", {"weeks": 12}))
             check("weekly series built", len(res["weekly"]) >= 4, str(len(res["weekly"])))
-            check("verdict computed", res.get("verdict") is not None)
-            print(f"     verdict: {res['verdict']}")
-            check(
-                "detects the improving trend baked into the mock",
-                res["verdict"]["reading"] == "improving",
-                res["verdict"]["reading"],
-            )
-            check("caveat included", "comparable" in res["caveat"])
+            check("earlier vs recent computed", res.get("earlier_vs_recent") is not None)
+            print(f"     {res['earlier_vs_recent']}")
 
             print("\n10. bad input handling")
             res = payload(await session.call_tool("training_summary", {"weeks": 999}))

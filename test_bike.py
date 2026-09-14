@@ -77,12 +77,9 @@ async def main():
             check("estimated power flagged on outdoor rides",
                   any(a["power_source"] == "estimated" for a in bike["activities"] if a["type"] == "Ride"))
 
-            print("\n4. pace_at_hr_trend refuses bikes")
-            for t in ("Bike", "Ride", "VirtualRide", "gravelride"):
-                res = await s.call_tool("pace_at_hr_trend", {"weeks": 12, "activity_type": t})
-                text = res.content[0].text if res.content else ""
-                check(f"'{t}' is an error pointing at power_at_hr_trend",
-                      res.isError and "power_at_hr_trend" in text, text[:80])
+            print("\n4. easy_pace_trend never includes rides")
+            ep = payload(await s.call_tool("easy_pace_trend", {"weeks": 4, "name_contains": "Zwift"}))
+            check("a ride name matches no easy runs", ep["weekly"] == [], ep["weekly"])
 
             print("\n5. power_at_hr_trend on measured power")
             p = payload(await s.call_tool("power_at_hr_trend", {"weeks": 16}))
@@ -151,9 +148,9 @@ async def main():
             check("speed_kmh on the detail", act["speed_kmh"] is not None and act["pace_min_km"] is None)
 
             print("\n9. activity_detail on a structured run still returns reps")
-            hard = next(a for a in runs["activities"] if a["avg_hr"] and a["avg_hr"] > 140)
+            hard = next(a for a in runs["activities"] if a["name"] == "Perth - 3k")
             det = payload(await s.call_tool("activity_detail", {"activity_id": hard["id"]}))
-            check("reps returned", len(det["intervals"]) == 5, len(det["intervals"]))
+            check("intervals returned", len(det["intervals"]) > 10, len(det["intervals"]))
             check("rep pace in min/km", det["intervals"][0]["pace_min_km"] is not None)
 
     print("\n" + "=" * 60)
