@@ -69,12 +69,32 @@ class Session:
             self.add("WORK", pace + self.rng.randint(-10, 10), 1000, 118 + self.rng.randint(-3, 3),
                      "410s@118bpm80rpm", gain=float(self.rng.randint(0, 20)))
 
-    def reps(self, n, dist, pace, group):
+    def reps(self, n, dist, pace, group, lap_m=None, dropout_rep=None):
+        """n reps of dist metres at pace s/km, 60s recoveries between.
+
+        group: suffix of the intervals.icu group_id laps of one length share, or
+            None for a manual-lap recording where the API gives no groups at all.
+        lap_m: the watch auto-laps every lap_m metres, so a rep longer than that
+            arrives as several back-to-back WORK laps (with a 1s lap-button tap
+            between them on the first rep, as happens in real recordings).
+        dropout_rep: index of a rep whose last lap records a dead HR strap.
+        """
         for i in range(n):
-            # HR lags on the first rep, which is why reps are judged by group HR.
-            hr = 139 if i == 0 else 150 + self.rng.randint(-3, 3)
-            self.add("WORK", pace * dist / 1000 + self.rng.randint(-3, 3), dist, hr, group,
-                     gain=float(self.rng.choice([0, 0, 1.2, 2.4, 6.0])))
+            pieces = [dist]
+            if lap_m and dist > lap_m:
+                pieces = [lap_m] * (dist // lap_m)
+                if dist % lap_m >= 100:
+                    pieces.append(dist % lap_m)
+            for j, metres in enumerate(pieces):
+                # HR lags on the first rep, which is why reps are judged by group HR.
+                hr = 139 if i == 0 and j == 0 else 150 + self.rng.randint(-3, 3)
+                secs = pace * metres / 1000 + self.rng.randint(-3, 3)
+                grp = f"{int(secs)}s@{group}" if group else None
+                if dropout_rep == i and j == len(pieces) - 1:
+                    hr, grp = 127, (f"{int(secs)}s@127bpm89rpm" if group else None)
+                self.add("WORK", secs, metres, hr, grp, gain=float(self.rng.choice([0, 0, 1.2, 2.4, 6.0])))
+                if i == 0 and j < len(pieces) - 1:
+                    self.add("RECOVERY", 1, 3, 150, None)
             if i < n - 1:
                 self.add("RECOVERY", 60, 80, 132, None)
                 # A lap-button tap: a 1-second "recovery".
@@ -111,6 +131,8 @@ def _activities():
         drift = 1 + week_idx * DRIFT
         # Two disrupted weeks with no quality work — a taper and an off week.
         disrupted = week_idx in (5, 11)
+        # Marathon recovery: one short jog all week.
+        recovery_week = week_idx == 9
         rng = random.Random(days_ago)
 
         base = {"start_date_local": f"{d.isoformat()}T06:15:00", "type": "Run", "trainer": None,
@@ -120,7 +142,10 @@ def _activities():
                 "race": False, "start_latlng": [0.0, 0.0]}
         runs = []
 
-        if dow == 5 and week_idx == 8:
+        if recovery_week:
+            if dow == 3:
+                runs.append({"name": "Perth Running", "distance": 2000, "pace": 400, "avg_hr": 110, "gain": 30})
+        elif dow == 5 and week_idx == 8:
             runs.append({"name": "Perth parkrun", "distance": 5000, "moving_time": int(1150 * drift),
                          "avg_hr": 170, "gain": 40, "hard": True})
         elif dow == 5 and week_idx == 12:
@@ -131,18 +156,34 @@ def _activities():
             runs.append({"name": "Perth - Saturday hit out", "distance": 10000, "moving_time": int(2460 * drift),
                          "avg_hr": 168, "gain": 90, "hard": True, "race": True})
         elif dow in (1, 3, 5) and not disrupted:
+            # Session names follow the athlete's convention: "<n>k" is the rep
+            # length, "Timed" reps are by the clock. The watch auto-laps every km,
+            # so anything longer than 1km arrives as consecutive WORK laps.
             s = Session(rng)
             s.easy_km(3, int(410 * drift))
-            s.add("WORK", 20, 90, 130, "20s@130bpm90rpm")  # a stride
-            if dow == 3:
-                # Mixed session: 1km reps and ~3-minute reps, never to be averaged together.
-                s.reps(4, 1000, 285 * drift, "285s@150bpm88rpm")
-                s.add("RECOVERY", 60, 80, 132, None)
-                s.reps(4, 680, 285 * drift, "194s@151bpm89rpm")
+            if dow == 1 and week_idx % 2 == 0:
+                s.add("WORK", 20, 90, 130, "20s@130bpm90rpm")  # a stride
+                s.reps(10, 1000, 280 * drift, "151bpm89rpm")
+                name = "Perth - 1k"
+            elif dow == 1:
+                # Warm-up runs straight into rep 1, and the strap dies on the last rep.
+                s.reps(4, 2000, 268 * drift, "154bpm91rpm", lap_m=1000, dropout_rep=3)
+                name = "Perth - 2k"
+            elif dow == 3:
+                # 4 x 8 minutes: each rep lands as a 1km lap plus a ~0.69km remainder.
+                s.reps(4, 1690, 284 * drift, "156bpm87rpm", lap_m=1000)
                 name = "Perth - Timed medium"
+            elif week_idx % 2 == 0:
+                # Manual laps: the API returns no group_id at all.
+                s.add("WORK", 20, 90, 130, None)  # a stride
+                s.reps(10, 1000, 280 * drift, None)
+                name = "Perth - 1k"
             else:
-                s.reps(10, 1000, 280 * drift, "280s@151bpm89rpm")
-                name = "Perth - 3k"
+                # Two rep lengths in one session, never to be averaged together.
+                s.reps(3, 2000, 282 * drift, "153bpm90rpm", lap_m=1000)
+                s.add("RECOVERY", 60, 80, 132, None)
+                s.reps(4, 1000, 275 * drift, "160bpm91rpm")
+                name = "Perth - ladder"
             s.easy_km(2, int(420 * drift))
             aid += 1
             out.append(s.activity({**base, "id": f"i{aid}", "name": name}))

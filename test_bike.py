@@ -148,7 +148,7 @@ async def main():
             check("speed_kmh on the detail", act["speed_kmh"] is not None and act["pace_min_km"] is None)
 
             print("\n9. activity_detail on a structured run still returns reps")
-            hard = next(a for a in runs["activities"] if a["name"] == "Perth - 3k")
+            hard = next(a for a in runs["activities"] if a["name"] == "Perth - 1k")
             det = payload(await s.call_tool("activity_detail", {"activity_id": hard["id"]}))
             check("intervals returned", len(det["intervals"]) > 10, len(det["intervals"]))
             check("rep pace in min/km", det["intervals"][0]["pace_min_km"] is not None)

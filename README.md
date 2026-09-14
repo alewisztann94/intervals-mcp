@@ -61,23 +61,34 @@ picked up; `name_contains` adds unusually named results.
 
 **`compare_sessions`** compares one workout across dates, rep by rep. What
 intervals.icu returns for a rep session is messier than "reps and recoveries":
-warm-up and cool-down kilometres are typed `WORK` too, and lap-button presses
-appear as 1-second recoveries. So reps are picked out in three steps:
+warm-up and cool-down kilometres are typed `WORK` too, lap-button presses appear
+as 1-second recoveries, and a watch that auto-laps every kilometre records a 2km
+rep as two `WORK` laps back to back (sometimes with a lap tap between them). So
+reps are picked out in four steps:
 
-1. Drop anything typed `RECOVERY`.
-2. Drop anything shorter than `min_rep_seconds` (default 90s): strides, lap taps.
+1. Drop anything typed `RECOVERY`, and anything shorter than `min_rep_seconds`
+   (default 90s): strides, lap taps, stops. A lap under 15s is a button press and
+   neither counts nor ends a rep.
+2. Join adjacent work laps into one rep when their pace is within 15% of the rep
+   so far. Warm-up running straight into rep 1 is a 25%+ jump in pace, so it is
+   never joined. Each rep reports `laps`, the number of laps it was built from.
 3. Drop easy running by heart rate. intervals.icu groups similar laps; a group
    only counts as reps if its average HR is above `min_rep_hr`, by default the top
    of zone 1 from your intervals.icu settings. Judging by the group rather than
-   each lap keeps a first rep whose HR is still climbing. A rep with a heart-rate
-   dropout can be dropped this way; each session's `left_out` counts show what was
-   excluded and why.
+   each lap keeps a first rep whose HR is still climbing. `min_rep_hr=0` skips
+   this step.
+4. Second opinion by pace. A block that failed the heart-rate test but was run
+   within 10% of the session's other reps is a rep whose strap dropped out (or
+   whose HR was still climbing). It is kept, marked `low_hr`, and its HR is left
+   out of the set's `mean_hr`; `low_hr_reps` counts them. Each session's
+   `left_out` counts show what was excluded and why, and a session in which no
+   block cleared the heart-rate test says so in `note`, with the HR to try.
 
 Reps of different lengths are never averaged together. `rep_seconds` keeps only
 reps of about that length (±`tolerance_pct`, default 15%); without it, each
-session's reps are split into sets of similar length and reported separately.
-Set averages are weighted by rep duration. `comparison` gives one line per set,
-oldest first.
+session's reps are split into sets of similar length (within `tolerance_pct` of
+the set's median) and reported separately. Set averages are weighted by rep
+duration. `comparison` gives one line per set, oldest first.
 
 **`easy_pace_trend`** reports weekly GAP, raw pace, HR, km and elevation per km
 for easy runs. A run counts as easy when its average HR is at or below `max_hr`
@@ -87,8 +98,12 @@ training: warm-up, cool-down and recoveries pull a sub-threshold session's
 *average* HR under the easy ceiling even though a third or more of it was hard
 running. On real data every such session had 31%+ of its time above zone 1, and
 46 of 53 easy runs had none. Weekly figures are duration-weighted; clipped edge
-weeks are dropped; `earlier_vs_recent` sets the first half of the window against
-the second, pace and HR side by side. `name_contains` restricts it to one route.
+weeks are dropped; weeks with well under the usual number of easy runs (a race
+week, illness) stay in the table but are listed in `light_weeks`, because their
+figures rest on one or two runs. `earlier_vs_recent` pools every run in the
+first half of the window against every run in the second, duration-weighted like
+the weekly figures, with pace and HR side by side and the run and km counts
+behind each figure. `name_contains` restricts it to one route.
 
 ### Bikes (parked)
 
@@ -241,6 +256,14 @@ so the suite runs without touching the real API or needing a key. It also counts
 requests, which is how the cache tests prove calls are actually being avoided.
 
 ```bash
+python run_tests.py            # starts the mock and the server, runs every suite
+python run_tests.py run cache  # just those suites
+```
+
+The same command runs in GitHub Actions on every push and pull request
+(`.github/workflows/tests.yml`). To run a suite by hand instead:
+
+```bash
 # terminal 1
 python -m uvicorn mock_intervals:app --port 9001
 
@@ -250,6 +273,7 @@ export INTERVALS_BASE=http://127.0.0.1:9001/api/v1 PORT=8080
 python server.py
 
 # terminal 3
+export MCP_SECRET_PATH=s3cr3t-test-path
 python test_server.py
 python test_bike.py
 python test_run.py
@@ -264,13 +288,19 @@ python test_cache.py     # needs the server restarted with CACHE_TTL_SECONDS=3
 - `test_run.py` — GAP and elevation per km on run rows; `race_history` (race flag,
   names, sessions like "3k" not mistaken for races, `name_contains`);
   `compare_sessions` (exactly the work reps: recoveries, strides, warm-up and
-  cool-down left out and counted, lagging first rep kept, rep lengths never mixed,
-  `rep_seconds` filter); `easy_pace_trend` (zone-1 defaults, rep sessions kept out
-  even when their average HR is under the ceiling, separate pace and HR columns,
-  route filter).
+  cool-down left out and counted; lagging first rep kept whether or not
+  intervals.icu grouped the laps; auto-lapped 2km and 8-minute reps joined back
+  into whole reps; an HR-dropout rep kept, flagged and left out of `mean_hr`;
+  rep lengths never mixed; `rep_seconds` filter; `min_rep_hr=0`);
+  `easy_pace_trend` (zone-1 defaults, rep sessions kept out even when their
+  average HR is under the ceiling, separate pace and HR columns, route filter,
+  light weeks flagged, pooled `earlier_vs_recent`).
 - `test_cache.py` — that repeats avoid the network, distinct arguments don't
   collide, concurrent calls don't stampede, the TTL expires, and failures are
   never cached.
+
+The mock's dates are relative to today, so every check must hold on any weekday;
+the current week may be empty or a single session.
 
 ## Cost
 
